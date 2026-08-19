@@ -1,0 +1,21 @@
+# Nedladdade Tessera-tiles och arbetsfiler
+Tessera_nedladdning/
+Tessera_arbetsmapp*/
+cache/
+*.npy
+*.tif
+*.tiff
+
+# Geodatabaser och utdata
+*.gdb/
+
+# Python
+__pycache__/
+*.pyc
+
+# ArcGIS
+*.lock
+*.aprx.bak
+
+# Esri-genererade metadatastubbar
+*.pyt.xml
