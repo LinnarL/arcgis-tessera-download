@@ -76,6 +76,16 @@ wrong does not fail, it downloads a different part of the world.
 The output CRS is separate and defaults to SWEREF99 TM in mosaic mode. Set Koordinatsystem för
 mosaiken if you want the raster in your project's own CRS instead.
 
+## Interrupted downloads
+
+A tile is close to 90 MB, so a dropped connection part way through a large extract is normal.
+Transfers are retried with backoff, and a partial file is kept in the cache and resumed with a
+Range request rather than started over. If a run does fail, just run it again: finished tiles
+are reused and a half-finished one continues from where it stopped.
+
+Partial files are validated against the server's ETag before being resumed, so a leftover from
+an earlier version of the data is discarded instead of producing a corrupt raster.
+
 ## Notes on the data
 
 - Tiles are a 0.1 degree grid with centres at `k * 0.1 + 0.05`.

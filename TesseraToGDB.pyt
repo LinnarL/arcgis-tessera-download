@@ -31,12 +31,12 @@ Krav  : ArcGIS Pro 3.x (arcpy). Inga paket utöver Pythons standardbibliotek.
 """
 
 import concurrent.futures
-import json
 import math
 import os
 import re
 import shutil
 import tempfile
+import time
 import urllib.error
 import urllib.request
 
@@ -80,9 +80,19 @@ _SYNC_HINTS = ("onedrive", "sharepoint", "dropbox", "google drive")
 _CACHE_DIRNAME = "Tessera_nedladdning"
 _SCRATCH_DIRNAME = "Tessera_arbetsmapp"
 
-_HTTP_TIMEOUT = 60
+_HTTP_TIMEOUT = 120
 _HEAD_WORKERS = 8
 _USER_AGENT = "TesseraToGDB.pyt (ArcGIS Pro)"
+
+# Timeouten gäller varje enskild läsning, inte hela överföringen, så en stor
+# chunk kan hinna slå i taket på en långsam förbindelse innan den är full.
+# 1 MB åt gången tål ned till ungefär 9 kB/s innan det blir timeout.
+_READ_CHUNK = 1024 * 1024
+
+# Nedladdningen görs om vid tillfälliga fel. En avbruten fil återupptas med
+# Range-huvud i stället för att hämtas om från början; servern stöder det.
+_DOWNLOAD_ATTEMPTS = 4
+_RETRY_STATUS = (408, 429, 500, 502, 503, 504)
 
 # Cache för storleksuppslagningar, delad mellan updateParameters och execute.
 # Nyckel: (npy-katalog, år, lon, lat) -> (bytes eller None om tilen saknas)
@@ -288,6 +298,55 @@ def _head_size(url):
         raise
 
 
+def _remove_quietly(path):
+    try:
+        if os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _head_etag(url):
+    """Serverns ETag för en URL, eller None om den inte går att hämta."""
+    try:
+        with urllib.request.urlopen(_request(url, "HEAD"), timeout=_HTTP_TIMEOUT) as resp:
+            return resp.headers.get("ETag")
+    except Exception:
+        return None
+
+
+def _resume_is_safe(url, stamp_path):
+    """
+    Går det att bygga vidare på en halvfärdig fil?
+
+    En .part-fil vars längd råkar vara giltig men vars innehåll hör till en
+    äldre version av filen skulle annars ge en trasig raster som klarar
+    storlekskontrollen. Servern stöder Range men struntar i If-Range, så
+    jämförelsen får göras här: ETag:en sparas bredvid .part-filen när
+    nedladdningen börjar och måste stämma innan resten hämtas.
+    """
+    try:
+        with open(stamp_path, "r", encoding="utf-8") as fh:
+            stored = fh.read().strip()
+    except OSError:
+        return False
+    if not stored:
+        return False
+    current = _head_etag(url)
+    return bool(current) and current.strip() == stored
+
+
+def _write_stamp(stamp_path, etag):
+    if not etag:
+        _remove_quietly(stamp_path)
+        return
+    try:
+        with open(stamp_path, "w", encoding="utf-8") as fh:
+            fh.write(etag.strip())
+    except OSError:
+        pass
+
+
 def _download(url, target, expected_size=None, progress=None):
     """
     Hämta url till target. Redan hämtade filer återanvänds: när storleken är känd
@@ -306,32 +365,78 @@ def _download(url, target, expected_size=None, progress=None):
     if folder and not os.path.isdir(folder):
         os.makedirs(folder, exist_ok=True)
 
+    # Delvis hämtade filer ligger kvar som .part och återupptas, både mellan
+    # försöken nedan och mellan körningar. En tile är närmare 90 MB, och att
+    # börja om från noll varje gång en förbindelse hackar gör stora uttag
+    # praktiskt taget omöjliga.
     tmp = target + ".part"
-    try:
-        with urllib.request.urlopen(_request(url), timeout=_HTTP_TIMEOUT) as resp, \
-                open(tmp, "wb") as dst:
-            while True:
-                chunk = resp.read(4 * 1024 * 1024)
-                if not chunk:
-                    break
-                dst.write(chunk)
-                if progress:
-                    progress(len(chunk))
-        written = os.path.getsize(tmp)
-        if expected_size is not None and written != expected_size:
-            raise IOError(
-                "Nedladdningen av {} blev ofullständig ({} av {} byte).".format(
-                    os.path.basename(target), written, expected_size
+    stamp = tmp + ".etag"
+    done = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
+    if done and expected_size is not None and done > expected_size:
+        done = 0
+    if done and not _resume_is_safe(url, stamp):
+        # Okänd eller ändrad ETag: filen kan höra till en äldre version.
+        _remove_quietly(tmp)
+        _remove_quietly(stamp)
+        done = 0
+    if done and progress:
+        progress(done)
+
+    for attempt in range(_DOWNLOAD_ATTEMPTS):
+        last = attempt == _DOWNLOAD_ATTEMPTS - 1
+        try:
+            request = _request(url)
+            if done:
+                request.add_header("Range", "bytes={}-".format(done))
+
+            with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as resp:
+                resuming = getattr(resp, "status", None) == 206
+                if done and not resuming:
+                    # Servern struntade i Range och skickar hela filen igen.
+                    if progress:
+                        progress(-done)
+                    done = 0
+                if not resuming:
+                    _write_stamp(stamp, resp.headers.get("ETag"))
+                with open(tmp, "ab" if resuming else "wb") as dst:
+                    while True:
+                        chunk = resp.read(_READ_CHUNK)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                        done += len(chunk)
+                        if progress:
+                            progress(len(chunk))
+
+            if expected_size is not None and done != expected_size:
+                # Fel storlek betyder att .part inte hör ihop med filen på
+                # servern. Kasta den och börja om i stället för att bygga vidare.
+                _remove_quietly(tmp)
+                _remove_quietly(stamp)
+                done = 0
+                raise IOError(
+                    "Nedladdningen av {} blev ofullständig.".format(
+                        os.path.basename(target))
                 )
-            )
-        os.replace(tmp, target)
-    except Exception:
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except OSError:
-                pass
-        raise
+
+            os.replace(tmp, target)
+            _remove_quietly(stamp)
+            return target, False
+
+        except urllib.error.HTTPError as exc:
+            if exc.code not in _RETRY_STATUS or last:
+                raise
+        except (urllib.error.URLError, OSError) as exc:
+            if last:
+                raise ValueError(
+                    "Nedladdningen av {} avbröts: {}. {} av {} hämtat, det ligger kvar "
+                    "i cachen och körningen fortsätter där den slutade nästa gång.".format(
+                        os.path.basename(target), exc, _human_size(done),
+                        _human_size(expected_size) if expected_size else "okänd storlek")
+                )
+            done = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
+
+        time.sleep(2 ** attempt)
 
     return target, False
 
@@ -342,6 +447,9 @@ def _http_error_msg(exc):
     if isinstance(exc, urllib.error.URLError):
         return ("Kunde inte nå Tessera-servern ({}). Kontrollera internetanslutning "
                 "och eventuell proxy.".format(exc.reason))
+    if isinstance(exc, TimeoutError):
+        return ("Servern svarade inte i tid. Halvfärdiga filer ligger kvar i cachen, "
+                "så en ny körning fortsätter där den slutade.")
     return "Fel vid anrop till Tessera-servern: {}".format(exc)
 
 
@@ -1352,7 +1460,7 @@ def _fetch_tiles(available, npy_dir, lm_dir, year, cache_dir, messages):
             ):
                 try:
                     _, reused = _download(url, path, size, progress)
-                except urllib.error.HTTPError as exc:
+                except (urllib.error.URLError, OSError) as exc:
                     raise ValueError(
                         "Kunde inte hämta {}: {}".format(os.path.basename(path),
                                                          _http_error_msg(exc))
@@ -1506,12 +1614,14 @@ def _clear_cache(available, npy_dir, lm_dir, year, cache_dir, messages):
     for tile in available:
         lon, lat = tile
         emb, scales, landmask = _tile_paths(cache_dir, npy_dir, year, lon, lat)
-        for path in (emb, scales, landmask):
-            try:
-                if os.path.isfile(path):
-                    os.remove(path)
-            except OSError as exc:
-                messages.addWarningMessage("  Kunde inte ta bort {}: {}".format(path, exc))
+        for base in (emb, scales, landmask):
+            for path in (base, base + ".part", base + ".part.etag"):
+                try:
+                    if os.path.isfile(path):
+                        os.remove(path)
+                except OSError as exc:
+                    messages.addWarningMessage(
+                        "  Kunde inte ta bort {}: {}".format(path, exc))
         folder = os.path.dirname(emb)
         try:
             if os.path.isdir(folder) and not os.listdir(folder):
