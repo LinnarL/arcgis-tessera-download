@@ -32,7 +32,7 @@ The UI is in Swedish, matching a Swedish ArcGIS Pro install.
 | Parameter | Default | Notes |
 |---|---|---|
 | Bounding box | current map view | Area to download |
-| Koordinatsystem för bounding boxen | SWEREF99 TM | Used when the extent carries no CRS of its own |
+| Koordinatsystem för bounding boxen | the map's CRS | How the extent numbers are read. ArcGIS hands the tool an extent without a CRS, so this is the tool's only way to know |
 | År | 2024 | 2017 to 2025 for the v1 dataset |
 | Dataset-version | v1 | v1 is global. v2 is beta with partial year coverage, v1.1 is Cambridge only |
 | Band att spara | all 128 | Accepts `1-16,64`. Reduces geodatabase size, not download size |
@@ -59,6 +59,22 @@ you want the values untouched.
 
 Values are 32-bit float. Tessera stores embeddings quantised as int8 with one scale factor per
 pixel, and the tool multiplies them out before writing.
+
+## Coordinate systems
+
+ArcGIS passes the bounding box to the tool as four numbers with no coordinate system attached,
+so the tool cannot detect which CRS you drew the box in. It assumes the active map's CRS, which
+is right in almost every case, and prints the assumption on the first line of the run log:
+
+```
+Bounding box tolkas som SWEREF99_18_00 (EPSG:3011): 173565.35, 6578601.74 till 177565.35, 6582601.74
+```
+
+If that line names the wrong system, set Koordinatsystem för bounding boxen yourself. Getting it
+wrong does not fail, it downloads a different part of the world.
+
+The output CRS is separate and defaults to SWEREF99 TM in mosaic mode. Set Koordinatsystem för
+mosaiken if you want the raster in your project's own CRS instead.
 
 ## Notes on the data
 

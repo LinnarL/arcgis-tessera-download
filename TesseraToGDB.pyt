@@ -732,6 +732,32 @@ def _default_extent():
     return None
 
 
+def _map_sr():
+    """Aktiva kartans koordinatsystem, eller None utanför ett öppet projekt."""
+    try:
+        _aprx, map_obj = _current_map()
+        if map_obj is not None:
+            sr = map_obj.spatialReference
+            if _sr_is_valid(sr):
+                return sr
+    except Exception:
+        pass
+    return None
+
+
+def _default_extent_crs():
+    """
+    Standardvärde för bounding boxens koordinatsystem: kartans eget.
+
+    En ruta som väljs i dialogen (kartans utbredning, ett lagers utbredning
+    eller en ruta man ritar) uttrycks i kartans koordinatsystem, men GPExtent
+    lämnar bara fyra tal vidare — spatialReference är None. Utan kartans
+    koordinatsystem som utgångspunkt tolkas talen i fel system, och ett projekt
+    i t.ex. SWEREF 99 18 00 hämtar då data för fel plats utan att något larmar.
+    """
+    return _map_sr() or _sr(SWEREF99TM_WKID)
+
+
 def _default_cache_dir():
     """
     Standardmapp för nedladdade tiles: lokal temp-mapp.
@@ -787,7 +813,7 @@ class HamtaTesseraRaster:
             name="extent_crs", datatype="GPCoordinateSystem",
             parameterType="Optional", direction="Input",
         )
-        p_extent_crs.value = _sr(SWEREF99TM_WKID)
+        p_extent_crs.value = _default_extent_crs()
 
         p_year = arcpy.Parameter(
             displayName="År",
@@ -998,21 +1024,23 @@ class HamtaTesseraRaster:
             return "Kunde inte uppskatta storleken: {}".format(exc)
 
     @staticmethod
-    def _crs_param(parameter):
+    def _crs_param(parameter, default=None):
         """
-        Koordinatsystemet ur en GPCoordinateSystem-parameter, eller SWEREF99 TM
-        om den är tom. Egna koordinatsystem (faktorkod 0 men med WKT-definition)
-        behålls — annars skulle koordinaterna tystlåtet tolkas som SWEREF99 TM.
+        Koordinatsystemet ur en GPCoordinateSystem-parameter, eller default om
+        den är tom. Egna koordinatsystem (faktorkod 0 men med WKT-definition)
+        behålls — annars skulle koordinaterna tystlåtet tolkas som något annat.
         """
         if parameter.value is not None:
             sr = _coerce_sr(parameter.valueAsText) or _coerce_sr(parameter.value)
             if sr is not None:
                 return sr
-        return _sr(SWEREF99TM_WKID)
+        return default or _sr(SWEREF99TM_WKID)
 
     @classmethod
     def _extent_crs_sr(cls, p_extent_crs):
-        return cls._crs_param(p_extent_crs)
+        # Tom parameter betyder kartans koordinatsystem, inte SWEREF99 TM:
+        # rutan kommer från kartan och ska tolkas i kartans system.
+        return cls._crs_param(p_extent_crs, _default_extent_crs())
 
     @classmethod
     def _target_sr(cls, p_target_crs):
@@ -1039,7 +1067,18 @@ class HamtaTesseraRaster:
                 "och måste börja med en bokstav eller ett understreck."
             )
 
-        ext = _extent_from_value(p_extent.value, self._extent_crs_sr(p_extent_crs))
+        # Rutan kommer från kartan men bär inget koordinatsystem med sig, så en
+        # avvikelse här betyder nästan alltid att data hämtas för fel plats.
+        extent_sr = self._extent_crs_sr(p_extent_crs)
+        map_sr = _map_sr()
+        if map_sr is not None and _sr_label(map_sr) != _sr_label(extent_sr):
+            p_extent_crs.setWarningMessage(
+                "Kartan använder {}. Rutan tolkas som {} — kontrollera att det är rätt, "
+                "annars hämtas data för fel plats.".format(
+                    _sr_label(map_sr), _sr_label(extent_sr))
+            )
+
+        ext = _extent_from_value(p_extent.value, extent_sr)
         if ext is not None:
             if ext.XMax <= ext.XMin or ext.YMax <= ext.YMin:
                 p_extent.setErrorMessage("Bounding boxen har ingen yta.")
@@ -1138,6 +1177,21 @@ def _run(extent_value, fallback_sr, year, dataset, bands_text, out_gdb, out_name
         raise ValueError("Kunde inte tolka bounding boxen.")
     if ext.XMax <= ext.XMin or ext.YMax <= ext.YMin:
         raise ValueError("Bounding boxen har ingen yta.")
+
+    # Vilket koordinatsystem rutan tolkas i skrivs ut. GPExtent lämnar bara fyra
+    # tal vidare, så tolkningen är ett antagande: syns den i loggen går det att
+    # upptäcka att data hämtats för fel plats i stället för att undra efteråt.
+    messages.addMessage(
+        "Bounding box tolkas som {}: {:.2f}, {:.2f} till {:.2f}, {:.2f}".format(
+            _sr_label(ext.spatialReference), ext.XMin, ext.YMin, ext.XMax, ext.YMax)
+    )
+    map_sr = _map_sr()
+    if map_sr is not None and _sr_label(map_sr) != _sr_label(ext.spatialReference):
+        messages.addWarningMessage(
+            "Kartan använder {} men rutan tolkas som {}. Stämmer det inte hämtas data "
+            "för fel plats — ändra 'Koordinatsystem för bounding boxen'.".format(
+                _sr_label(map_sr), _sr_label(ext.spatialReference))
+        )
 
     bbox = _project_extent(ext, _sr(WGS84_WKID))
     tiles = _tiles_for_bbox(bbox.XMin, bbox.YMin, bbox.XMax, bbox.YMax)
