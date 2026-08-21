@@ -457,6 +457,14 @@ def _http_error_msg(exc):
 # Storleksuppskattning
 # =============================================================================
 
+def _duration(seconds):
+    """Sekunder som lasbar text: '42 s' eller '3 min 20 s'."""
+    seconds = max(float(seconds), 0.0)
+    if seconds < 90:
+        return "{:.0f} s".format(seconds)
+    return "{:.0f} min {:.0f} s".format(seconds // 60, seconds % 60)
+
+
 def _human_size(num_bytes):
     size = float(num_bytes)
     for unit in ("B", "KB", "MB", "GB", "TB"):
@@ -1355,11 +1363,20 @@ def _run(extent_value, fallback_sr, year, dataset, bands_text, out_gdb, out_name
                       mode, messages)
 
     # 3. Hämta rådata
+    started = time.time()
     cached_bytes = _fetch_tiles(available, npy_dir, lm_dir, year, cache_dir, messages)
-    messages.addMessage("Nedladdning klar ({} hämtat, resten fanns i cachen).".format(
-        _human_size(cached_bytes)))
+    download_secs = time.time() - started
+    if cached_bytes:
+        messages.addMessage(
+            "Nedladdning klar: {} på {} ({}/s), resten fanns i cachen.".format(
+                _human_size(cached_bytes), _duration(download_secs),
+                _human_size(cached_bytes / max(download_secs, 0.001)))
+        )
+    else:
+        messages.addMessage("Nedladdning klar: allt fanns redan i cachen.")
 
     # 4. Bygg raster
+    started = time.time()
     if mode == MODE_MOSAIC:
         outputs = _build_mosaic(available, npy_dir, lm_dir, year, band_indices,
                                 cache_dir, out_gdb, out_name, target_sr, target_ext,
@@ -1367,6 +1384,13 @@ def _run(extent_value, fallback_sr, year, dataset, bands_text, out_gdb, out_name
     else:
         outputs = _build_tiles(available, npy_dir, lm_dir, year, band_indices,
                                cache_dir, out_gdb, out_name, overwrite, messages)
+    build_secs = time.time() - started
+
+    # Att skriva och projicera om 32-bitars float tar normalt längre tid än
+    # nedladdningen, särskilt med alla 128 band. Tiderna skrivs ut så att en
+    # långsam körning går att placera i rätt steg i stället för att gissa.
+    messages.addMessage("Tidsåtgång: nedladdning {}, rasterbygge {}.".format(
+        _duration(download_secs), _duration(build_secs)))
 
     if not outputs:
         messages.addWarningMessage("Ingen raster skapades.")
@@ -1436,14 +1460,21 @@ def _fetch_tiles(available, npy_dir, lm_dir, year, cache_dir, messages):
     Returnerar antalet byte som faktiskt passerade nätverket.
     """
     total = _download_bytes(available)
-    state = {"done": 0, "network": 0}
+    state = {"done": 0, "network": 0, "percent": -1}
 
     arcpy.SetProgressor("step", "Hämtar Tessera-tiles...", 0, 100, 1)
 
     def progress(chunk):
+        # Förloppsindikatorn uppdateras bara när heltalsprocenten ändras.
+        # SetProgressorPosition går via Pros gränssnitt och är dyr nog att
+        # märkas om den anropas för varje läst chunk.
         state["done"] += chunk
-        if total:
-            arcpy.SetProgressorPosition(min(int(state["done"] * 100 / total), 100))
+        if not total:
+            return
+        percent = min(int(state["done"] * 100 / total), 100)
+        if percent != state["percent"]:
+            state["percent"] = percent
+            arcpy.SetProgressorPosition(percent)
 
     try:
         for index, (tile, emb_size) in enumerate(sorted(available.items()), start=1):
