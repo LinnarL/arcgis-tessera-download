@@ -5,8 +5,8 @@ file geodatabase.
 
 Tessera is an Earth observation foundation model from the University of Cambridge. It publishes
 global annual embeddings built from Sentinel-1 and Sentinel-2: 128 channels per pixel at 10 m
-resolution. The data is served as plain HTTPS files from Source Cooperative and needs no API key
-or account.
+resolution. Downloads and the tile registry are handled by the `geotessera` package, which reads
+from the project's public S3 bucket. No API key or account is needed.
 
 The data is large. One tile covers about 11 km and is roughly 90 MB to download, or 360 MB in
 the geodatabase once written as 32-bit float with all 128 bands. The tool therefore shows the
@@ -16,14 +16,31 @@ refuses to start above a configurable limit.
 ## Requirements
 
 - ArcGIS Pro 3.x. Developed and tested on 3.6 with Python 3.13.
-- No dependencies beyond `arcpy`, `numpy` and the standard library.
-- Internet access to `data.source.coop`.
+- The `geotessera` package, which handles the tile registry and downloads.
+- Internet access to `s3.us-west-2.amazonaws.com`.
+
+`geotessera` is not part of the default `arcgispro-py3` environment, and ArcGIS Pro
+does not allow installing into it. Clone the environment first.
 
 ## Install
 
-1. Clone or download this repo.
-2. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `TesseraToGDB.pyt`.
-3. Open Tessera, Hämta Tessera-raster till geodatabas.
+1. In ArcGIS Pro: Settings, Package Manager, clone the active environment. Name the
+   clone something like `arcgispro-py3-personal` and make it active.
+2. Install geotessera into the clone, then pin pyarrow back to the version Pro
+   supports. geotessera pulls a newer pyarrow that fails to load once `arcpy` is
+   imported, which breaks the registry:
+
+   ```
+   python -m pip install geotessera
+   python -m pip install "pyarrow==20.0.0"
+   ```
+
+3. Clone or download this repo.
+4. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `TesseraToGDB.pyt`.
+5. Open Tessera, Hämta Tessera-raster till geodatabas.
+
+If the environment is wrong the tool stops with a message naming the active
+environment rather than failing part way through a download.
 
 ## The tool dialog
 
@@ -37,7 +54,7 @@ The UI is in Swedish, matching a Swedish ArcGIS Pro install.
 | Dataset-version | v1 | v1 is global. v2 is beta with partial year coverage, v1.1 is Cambridge only |
 | Band att spara | all 128 | Accepts `1-16,64`. Reduces geodatabase size, not download size |
 | Uppskattad storlek | read only | Download size, geodatabase size and temporary disk use |
-| Kontrollera exakt storlek mot servern | off | Queries the server for the true size of every tile |
+| Kontrollera exakt storlek mot servern | off | Uses the registry to report only the tiles that really exist and their true sizes |
 | Utdata-geodatabas | project default | Must be a file geodatabase |
 | Namn på utdata-raster | `tessera_<år>` | Follows the year until you type your own name |
 | Utdataform | mosaik | Single merged raster, or one raster per tile in native UTM |
@@ -76,15 +93,16 @@ wrong does not fail, it downloads a different part of the world.
 The output CRS is separate and defaults to SWEREF99 TM in mosaic mode. Set Koordinatsystem för
 mosaiken if you want the raster in your project's own CRS instead.
 
-## Interrupted downloads
+## Downloads and caching
 
-A tile is close to 90 MB, so a dropped connection part way through a large extract is normal.
-Transfers are retried with backoff, and a partial file is kept in the cache and resumed with a
-Range request rather than started over. If a run does fail, just run it again: finished tiles
-are reused and a half-finished one continues from where it stopped.
+Downloads go through geotessera, which reads from the project's S3 bucket. Tiles are cached in
+the folder given by Cache-mapp för nedladdade tiles and reused across runs, so a repeated or
+resumed run only fetches what is missing.
 
-Partial files are validated against the server's ETag before being resumed, so a leftover from
-an earlier version of the data is discarded instead of producing a corrupt raster.
+The first run also downloads a manifest listing every published tile. It takes a while and is
+cached afterwards. That manifest is what makes the size estimate exact without any extra
+requests: the tool asks the registry which tiles exist and how large they are before fetching
+anything.
 
 ## Notes on the data
 
@@ -92,12 +110,12 @@ an earlier version of the data is discarded instead of producing a corrupt raste
 - Each tile sits in its own UTM zone. A bounding box in Sweden commonly spans two zones.
 - The `.npy` files carry no georeferencing. Coordinate system and origin come from the tile's
   landmask GeoTIFF, which the tool downloads alongside the data.
-- Tiles over open water are not published and return HTTP 404. The tool reports how many of the
-  requested tiles actually exist and skips the rest.
+- Tiles over open water are not published. The registry knows which tiles exist, so the tool
+  reports how many of the requested tiles are available and skips the rest before downloading.
 - Selecting fewer bands does not reduce the download. The whole 128 channel file has to be
   fetched either way.
 
 ## Source
 
-- Data: https://data.source.coop/tessera/tessera
 - Project: https://geotessera.org/
+- Library: https://github.com/ucam-eo/geotessera

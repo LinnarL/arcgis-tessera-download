@@ -7,11 +7,12 @@ en filgeodatabas.
 
 Tessera är en foundation model för jordobservation (Sentinel-1 + Sentinel-2) som
 publicerar globala, årsvisa embeddings: 128 kanaler per pixel i 10 m upplösning.
-Data hämtas som vanliga HTTPS-filer från Source Cooperative:
 
-    npy/{version}/{år}/grid_{lon}_{lat}/grid_{lon}_{lat}.npy         int8  (H, W, 128)
-    npy/{version}/{år}/grid_{lon}_{lat}/grid_{lon}_{lat}_scales.npy  float32 (H, W)
-    landmasks/{version}/grid_{lon}_{lat}.tiff                        georeferering
+Nedladdning och register sköts av biblioteket geotessera, som hämtar data direkt
+från projektets S3-bucket. Verktyget använder geotessera för att veta vilka tiles
+som finns, hur stora de är och för att hämta dem till en cache-mapp, och gör
+sedan resten med arcpy och numpy: dekvantisering, omprojicering och skrivning
+till geodatabasen.
 
 Embeddings lagras kvantiserade som int8 med en skalfaktor per pixel. Det verkliga
 värdet är int8 * scale, vilket verktyget räknar ut (dekvantisering) innan data
@@ -19,37 +20,45 @@ skrivs som 32-bitars float-raster.
 
 Rutnätet är 0,1 x 0,1 grader med tile-centrum på k*0,1 + 0,05. Varje tile ligger i
 sin egen UTM-zon och saknar georeferering i .npy-filen — koordinatsystem och
-origo läses därför ur tilens landmask-GeoTIFF. Tiles över öppet vatten finns inte
-alls (HTTP 404).
+origo läses därför ur tilens landmask-GeoTIFF.
 
 En tile är ca 90 MB nedladdat och ca 360 MB som 32-bitars float med alla 128 band.
 Verktyget visar därför storleken innan något hämtas, både i dialogen och i
-körningens första meddelanden.
+körningens första meddelanden. Storleken kommer ur geotesseras register och
+kostar inga extra anrop.
 
-Källa : https://data.source.coop/tessera/tessera  (https://geotessera.org/)
-Krav  : ArcGIS Pro 3.x (arcpy). Inga paket utöver Pythons standardbibliotek.
+Krav : ArcGIS Pro 3.x (arcpy), numpy och geotessera.
+       geotessera finns inte i standardmiljön arcgispro-py3. Klona miljön och
+       installera paketet, t.ex. arcgispro-py3-personal, och peka Pro på den
+       kloningen innan verktygslådan används.
+
+Källa : https://geotessera.org/  (data via s3://tessera-embeddings)
 """
 
-import concurrent.futures
 import math
 import os
 import re
 import shutil
 import tempfile
 import time
-import urllib.error
-import urllib.request
 
 import numpy as np
 
 import arcpy
 
+try:
+    from geotessera import GeoTessera
+    from geotessera import registry as gt_registry
+    _GEOTESSERA_ERROR = None
+except Exception as _exc:                                   # noqa: BLE001
+    GeoTessera = None
+    gt_registry = None
+    _GEOTESSERA_ERROR = _exc
+
 # ── Konstanter ────────────────────────────────────────────────────────────────
 
 SWEREF99TM_WKID = 3006
 WGS84_WKID = 4326
-
-BASE_URL = "https://data.source.coop/tessera/tessera"
 
 TILE_DEG = 0.1          # tile-sida i grader
 CELL_SIZE_M = 10.0      # upplösning i meter
@@ -57,11 +66,13 @@ N_BANDS = 128           # kanaler per pixel
 NPY_HEADER_BYTES = 128  # .npy v1.0-header för dessa filer
 LANDMASK_BYTES = 15_000  # ungefärlig storlek, försumbar men räknas med
 
-# Dataset-versioner: etikett -> (katalog i npy/, katalog i landmasks/)
+# Dataset-versioner: etikett -> (version, variant) som geotessera vill ha dem.
+# v1 är den globala produktionskörningen; v1.1 Cambridge täcker bara delar av
+# Europa och v2 är en beta med ojämn täckning per år.
 DATASETS = {
-    "v1 (global, 2017-2025)":      ("v1", "v1"),
-    "v2 beta (delvis täckning)":   ("v2-2B-L~beta1", "v2"),
-    "v1.1 Cambridge (regional)":   ("v1.1-cam", "v1.1"),
+    "v1 (global, 2017-2025)":      ("v1", "vultr"),
+    "v1.1 Cambridge (regional)":   ("v1.1", "cambridge"),
+    "v2 beta (delvis täckning)":   ("v2", "2B-L~beta1"),
 }
 DEFAULT_DATASET = "v1 (global, 2017-2025)"
 
@@ -79,20 +90,6 @@ _SYNC_HINTS = ("onedrive", "sharepoint", "dropbox", "google drive")
 
 _CACHE_DIRNAME = "Tessera_nedladdning"
 _SCRATCH_DIRNAME = "Tessera_arbetsmapp"
-
-_HTTP_TIMEOUT = 120
-_HEAD_WORKERS = 8
-_USER_AGENT = "TesseraToGDB.pyt (ArcGIS Pro)"
-
-# Timeouten gäller varje enskild läsning, inte hela överföringen, så en stor
-# chunk kan hinna slå i taket på en långsam förbindelse innan den är full.
-# 1 MB åt gången tål ned till ungefär 9 kB/s innan det blir timeout.
-_READ_CHUNK = 1024 * 1024
-
-# Nedladdningen görs om vid tillfälliga fel. En avbruten fil återupptas med
-# Range-huvud i stället för att hämtas om från början; servern stöder det.
-_DOWNLOAD_ATTEMPTS = 4
-_RETRY_STATUS = (408, 429, 500, 502, 503, 504)
 
 # Cache för storleksuppslagningar, delad mellan updateParameters och execute.
 # Nyckel: (npy-katalog, år, lon, lat) -> (bytes eller None om tilen saknas)
@@ -255,202 +252,134 @@ def _grid_name(lon, lat):
     return "grid_{:.2f}_{:.2f}".format(lon, lat)
 
 
-def _embedding_url(npy_dir, year, lon, lat):
-    name = _grid_name(lon, lat)
-    return "{}/npy/{}/{}/{}/{}.npy".format(BASE_URL, npy_dir, year, name, name)
-
-
-def _scales_url(npy_dir, year, lon, lat):
-    name = _grid_name(lon, lat)
-    return "{}/npy/{}/{}/{}/{}_scales.npy".format(BASE_URL, npy_dir, year, name, name)
-
-
-def _landmask_url(lm_dir, lon, lat):
-    return "{}/landmasks/{}/{}.tiff".format(BASE_URL, lm_dir, _grid_name(lon, lat))
-
-
 def _tile_token(value):
     """Kortform av en tile-koordinat för featureklass-/rasternamn: 18.05 -> 1805."""
     return ("m" if value < 0 else "") + "{:.2f}".format(abs(value)).replace(".", "")
 
 
 # =============================================================================
-# HTTP
+# geotessera: register och nedladdning
 # =============================================================================
 
-def _request(url, method="GET"):
-    return urllib.request.Request(url, headers={"User-Agent": _USER_AGENT}, method=method)
+def _require_geotessera():
+    """Ge ett begripligt fel när paketet saknas i den aktiva Python-miljön."""
+    if GeoTessera is None:
+        raise ValueError(
+            "Paketet geotessera kunde inte laddas i den Python-miljö som ArcGIS Pro "
+            "använder ({}). Klona arcgispro-py3, installera geotessera i kloningen "
+            "och byt aktiv miljö i Pro under Settings, Package Manager. "
+            "Ursprungligt fel: {}".format(_env_name(), _GEOTESSERA_ERROR)
+        )
 
 
-def _head_size(url):
+def _env_name():
+    import sys
+    return os.path.basename(os.path.normpath(sys.prefix))
+
+
+# Ett register per (version, variant, cache-mapp). Manifestet är stort och tar
+# tiotals sekunder att hämta första gången, så det återanvänds inom sessionen.
+_client_cache = {}
+
+
+def _client(dataset, cache_dir, messages=None):
     """
-    Content-Length för en URL, eller None om filen inte finns (HTTP 404).
-    Andra HTTP-fel skickas vidare — de beror på nätverk eller server, inte på
-    att tilen saknas, och ska inte tolkas som "ingen data här".
+    GeoTessera-klient för en dataset-etikett, med tiles cachade i cache_dir.
+
+    Första anropet hämtar manifestet över alla publicerade tiles. Det ligger kvar
+    i geotesseras egen cache mellan körningar, men kostar en stund första gången
+    och är värt ett meddelande i loggen.
     """
+    _require_geotessera()
+    if dataset not in DATASETS:
+        raise ValueError("Okänd dataset-version: {}".format(dataset))
+    version, variant = DATASETS[dataset]
+
+    key = (version, variant, os.path.abspath(str(cache_dir)))
+    if key in _client_cache:
+        return _client_cache[key]
+
+    if messages is not None:
+        messages.addMessage(
+            "Läser Tessera-registret ({} {})... första gången hämtas ett "
+            "manifest över alla tiles, vilket tar en stund.".format(version, variant)
+        )
     try:
-        with urllib.request.urlopen(_request(url, "HEAD"), timeout=_HTTP_TIMEOUT) as resp:
-            length = resp.headers.get("Content-Length")
-            return int(length) if length is not None else None
-    except urllib.error.HTTPError as exc:
-        if exc.code == 404:
-            return None
-        raise
+        client = GeoTessera(dataset_version=version, dataset_variant=variant,
+                            embeddings_dir=str(cache_dir))
+    except Exception as exc:                                # noqa: BLE001
+        raise ValueError(
+            "Kunde inte läsa Tessera-registret för {} {}: {}".format(version, variant, exc)
+        )
+    _client_cache[key] = client
+    return client
 
 
-def _remove_quietly(path):
+def _available_years(client):
+    """År som finns i registret, som strängar."""
     try:
-        if os.path.exists(path):
-            os.remove(path)
-    except OSError:
-        pass
+        return [str(y) for y in client.registry.get_available_years()]
+    except Exception:                                       # noqa: BLE001
+        return list(YEARS)
 
 
-def _head_etag(url):
-    """Serverns ETag för en URL, eller None om den inte går att hämta."""
+def _tile_sizes(client, year, tiles):
+    """
+    {(lon, lat): byte} för de tiles i listan som faktiskt finns, hämtat ur
+    registret. Storleken omfattar embedding, scales och landmask, alltså allt
+    verktyget laddar ned per tile. Registret gör att uppskattningen är exakt
+    utan ett enda extra nätverksanrop.
+    """
+    wanted = set(tiles)
+    if not wanted:
+        return {}
+
+    lons = [t[0] for t in wanted]
+    lats = [t[1] for t in wanted]
+    bounds = (min(lons) - TILE_DEG / 2, min(lats) - TILE_DEG / 2,
+              max(lons) + TILE_DEG / 2, max(lats) + TILE_DEG / 2)
+
+    sizes = {}
     try:
-        with urllib.request.urlopen(_request(url, "HEAD"), timeout=_HTTP_TIMEOUT) as resp:
-            return resp.headers.get("ETag")
-    except Exception:
-        return None
+        found = list(client.registry.iter_tiles_in_region(bounds, int(year)))
+    except Exception as exc:                                # noqa: BLE001
+        raise ValueError("Kunde inte söka i Tessera-registret: {}".format(exc))
 
-
-def _resume_is_safe(url, stamp_path):
-    """
-    Går det att bygga vidare på en halvfärdig fil?
-
-    En .part-fil vars längd råkar vara giltig men vars innehåll hör till en
-    äldre version av filen skulle annars ge en trasig raster som klarar
-    storlekskontrollen. Servern stöder Range men struntar i If-Range, så
-    jämförelsen får göras här: ETag:en sparas bredvid .part-filen när
-    nedladdningen börjar och måste stämma innan resten hämtas.
-    """
-    try:
-        with open(stamp_path, "r", encoding="utf-8") as fh:
-            stored = fh.read().strip()
-    except OSError:
-        return False
-    if not stored:
-        return False
-    current = _head_etag(url)
-    return bool(current) and current.strip() == stored
-
-
-def _write_stamp(stamp_path, etag):
-    if not etag:
-        _remove_quietly(stamp_path)
-        return
-    try:
-        with open(stamp_path, "w", encoding="utf-8") as fh:
-            fh.write(etag.strip())
-    except OSError:
-        pass
-
-
-def _download(url, target, expected_size=None, progress=None):
-    """
-    Hämta url till target. Redan hämtade filer återanvänds: när storleken är känd
-    krävs att den stämmer, annars räcker att filen finns och inte är tom (gäller
-    landmaskerna, som är små och statiska).
-    progress är en funktion som tar antal nya bytes, för förloppsindikatorn.
-    """
-    if os.path.isfile(target):
-        actual = os.path.getsize(target)
-        if (expected_size is None and actual > 0) or actual == expected_size:
-            if progress:
-                progress(expected_size if expected_size is not None else actual)
-            return target, True
-
-    folder = os.path.dirname(target)
-    if folder and not os.path.isdir(folder):
-        os.makedirs(folder, exist_ok=True)
-
-    # Delvis hämtade filer ligger kvar som .part och återupptas, både mellan
-    # försöken nedan och mellan körningar. En tile är närmare 90 MB, och att
-    # börja om från noll varje gång en förbindelse hackar gör stora uttag
-    # praktiskt taget omöjliga.
-    tmp = target + ".part"
-    stamp = tmp + ".etag"
-    done = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
-    if done and expected_size is not None and done > expected_size:
-        done = 0
-    if done and not _resume_is_safe(url, stamp):
-        # Okänd eller ändrad ETag: filen kan höra till en äldre version.
-        _remove_quietly(tmp)
-        _remove_quietly(stamp)
-        done = 0
-    if done and progress:
-        progress(done)
-
-    for attempt in range(_DOWNLOAD_ATTEMPTS):
-        last = attempt == _DOWNLOAD_ATTEMPTS - 1
+    for _year, lon, lat in found:
+        tile = (round(float(lon), 2), round(float(lat), 2))
+        if tile not in wanted or tile in sizes:
+            continue
+        total = 0
+        for getter, args in (
+            (client.registry.get_tile_file_size, (int(year), tile[0], tile[1])),
+            (client.registry.get_scales_file_size, (int(year), tile[0], tile[1])),
+            (client.registry.get_landmask_file_size, (tile[0], tile[1])),
+        ):
+            try:
+                total += int(getter(*args) or 0)
+            except Exception:                               # noqa: BLE001
+                pass
+        embedding = 0
         try:
-            request = _request(url)
-            if done:
-                request.add_header("Range", "bytes={}-".format(done))
-
-            with urllib.request.urlopen(request, timeout=_HTTP_TIMEOUT) as resp:
-                resuming = getattr(resp, "status", None) == 206
-                if done and not resuming:
-                    # Servern struntade i Range och skickar hela filen igen.
-                    if progress:
-                        progress(-done)
-                    done = 0
-                if not resuming:
-                    _write_stamp(stamp, resp.headers.get("ETag"))
-                with open(tmp, "ab" if resuming else "wb") as dst:
-                    while True:
-                        chunk = resp.read(_READ_CHUNK)
-                        if not chunk:
-                            break
-                        dst.write(chunk)
-                        done += len(chunk)
-                        if progress:
-                            progress(len(chunk))
-
-            if expected_size is not None and done != expected_size:
-                # Fel storlek betyder att .part inte hör ihop med filen på
-                # servern. Kasta den och börja om i stället för att bygga vidare.
-                _remove_quietly(tmp)
-                _remove_quietly(stamp)
-                done = 0
-                raise IOError(
-                    "Nedladdningen av {} blev ofullständig.".format(
-                        os.path.basename(target))
-                )
-
-            os.replace(tmp, target)
-            _remove_quietly(stamp)
-            return target, False
-
-        except urllib.error.HTTPError as exc:
-            if exc.code not in _RETRY_STATUS or last:
-                raise
-        except (urllib.error.URLError, OSError) as exc:
-            if last:
-                raise ValueError(
-                    "Nedladdningen av {} avbröts: {}. {} av {} hämtat, det ligger kvar "
-                    "i cachen och körningen fortsätter där den slutade nästa gång.".format(
-                        os.path.basename(target), exc, _human_size(done),
-                        _human_size(expected_size) if expected_size else "okänd storlek")
-                )
-            done = os.path.getsize(tmp) if os.path.isfile(tmp) else 0
-
-        time.sleep(2 ** attempt)
-
-    return target, False
+            embedding = int(
+                client.registry.get_tile_file_size(int(year), tile[0], tile[1]) or 0)
+        except Exception:                                   # noqa: BLE001
+            pass
+        if not embedding:
+            embedding = _approx_embedding_bytes(tile[1])
+        sizes[tile] = (total or embedding, embedding)
+    return sizes
 
 
-def _http_error_msg(exc):
-    if isinstance(exc, urllib.error.HTTPError):
-        return "HTTP-fel {} från Tessera-servern: {}".format(exc.code, exc.reason)
-    if isinstance(exc, urllib.error.URLError):
-        return ("Kunde inte nå Tessera-servern ({}). Kontrollera internetanslutning "
-                "och eventuell proxy.".format(exc.reason))
-    if isinstance(exc, TimeoutError):
-        return ("Servern svarade inte i tid. Halvfärdiga filer ligger kvar i cachen, "
-                "så en ny körning fortsätter där den slutade.")
-    return "Fel vid anrop till Tessera-servern: {}".format(exc)
+def _fetch_tile_files(client, year, lon, lat):
+    """
+    (embedding, scales, landmask) som lokala sökvägar, nedladdade vid behov.
+    geotessera återanvänder filer som redan ligger i cache-mappen.
+    """
+    embedding = client.registry.fetch(year=int(year), lon=lon, lat=lat, is_scales=False)
+    scales = client.registry.fetch(year=int(year), lon=lon, lat=lat, is_scales=True)
+    landmask = client.registry.fetch_landmask(lon=lon, lat=lat)
+    return embedding, scales, landmask
 
 
 # =============================================================================
@@ -458,7 +387,7 @@ def _http_error_msg(exc):
 # =============================================================================
 
 def _duration(seconds):
-    """Sekunder som lasbar text: '42 s' eller '3 min 20 s'."""
+    """Sekunder som läsbar text: '42 s' eller '3 min 20 s'."""
     seconds = max(float(seconds), 0.0)
     if seconds < 90:
         return "{:.0f} s".format(seconds)
@@ -473,74 +402,44 @@ def _human_size(num_bytes):
         size /= 1024.0
 
 
+def _approx_embedding_bytes(lat):
+    """
+    Ungefärlig storlek på en embedding-tile på en given latitud, som reserv när
+    registret inte kan svara.
+
+    En tile är 0,1 grader i 10 m-celler. Höjden är i praktiken ~1130 celler och
+    bredden krymper med cos(lat). Faktorerna kommer från uppmätta tiles, som har
+    en liten marginal utöver den nominella storleken.
+    """
+    height = TILE_DEG * 111_320.0 / CELL_SIZE_M * 1.02
+    width = TILE_DEG * 111_320.0 * math.cos(math.radians(lat)) / CELL_SIZE_M * 1.07
+    return int(max(height * width, 1.0) * N_BANDS) + NPY_HEADER_BYTES
+
+
+def _approx_tile_bytes(lat):
+    """Embedding plus scales plus landmask, ungefärligt."""
+    embedding = _approx_embedding_bytes(lat)
+    return embedding + _scales_bytes(embedding) + LANDMASK_BYTES
+
+
 def _scales_bytes(embedding_bytes):
     """
     Storleken på tilens scales-fil, härledd ur embeddingens storlek.
 
     Embeddingen är (H, W, 128) int8 och scales (H, W) float32, båda med samma
-    128-byte .npy-header, så H*W = (bytes - header) / 128. Ett HEAD-anrop per
-    tile räcker alltså för att veta exakt hur mycket som ska hämtas.
+    128-byte .npy-header, så H*W = (bytes - header) / 128.
     """
-    pixels = (embedding_bytes - NPY_HEADER_BYTES) // N_BANDS
-    return pixels * 4 + NPY_HEADER_BYTES
+    return _tile_pixels(embedding_bytes) * 4 + NPY_HEADER_BYTES
 
 
 def _tile_pixels(embedding_bytes):
-    return (embedding_bytes - NPY_HEADER_BYTES) // N_BANDS
-
-
-def _approx_tile_bytes(lat):
-    """
-    Ungefärlig storlek på en embedding-tile på en given latitud, för den
-    ögonblickliga uppskattningen i dialogen.
-
-    En tile är 0,1 grader i 10 m-celler. Höjden är i praktiken ~1130 celler och
-    bredden krymper med cos(lat). Faktorn 1,07 kommer från uppmätta tiles, där
-    rutorna har en liten marginal utöver den nominella storleken.
-    """
-    height = TILE_DEG * 111_320.0 / CELL_SIZE_M * 1.02
-    width = TILE_DEG * 111_320.0 * math.cos(math.radians(lat)) / CELL_SIZE_M * 1.07
-    pixels = max(height * width, 1.0)
-    return int(pixels * (N_BANDS + 4)) + 2 * NPY_HEADER_BYTES
-
-
-def _lookup_sizes(npy_dir, year, tiles, messages=None):
-    """
-    Exakt nedladdningsstorlek per tile via ett HEAD-anrop per tile.
-    Returnerar {(lon, lat): bytes eller None om tilen saknas}.
-    """
-    result = {}
-    missing = []
-    for lon, lat in tiles:
-        key = (npy_dir, year, lon, lat)
-        if key in _size_cache:
-            result[(lon, lat)] = _size_cache[key]
-        else:
-            missing.append((lon, lat))
-
-    if not missing:
-        return result
-
-    def probe(tile):
-        lon, lat = tile
-        return tile, _head_size(_embedding_url(npy_dir, year, lon, lat))
-
-    workers = min(_HEAD_WORKERS, len(missing))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as pool:
-        for tile, size in pool.map(probe, missing):
-            _size_cache[(npy_dir, year) + tile] = size
-            result[tile] = size
-
-    return result
+    """Antal pixlar i en tile, ur embeddingfilens storlek."""
+    return max((int(embedding_bytes) - NPY_HEADER_BYTES) // N_BANDS, 0)
 
 
 def _download_bytes(sizes):
-    """Totalt antal byte att hämta för {(lon, lat): embedding-bytes}."""
-    total = 0
-    for size in sizes.values():
-        if size:
-            total += size + _scales_bytes(size) + LANDMASK_BYTES
-    return total
+    """Totalt att hämta för {(lon, lat): (nedladdning, embedding)}."""
+    return sum(int(d) for d, _e in sizes.values())
 
 
 def _gdb_bytes(sizes, n_bands, mode, bbox_target):
@@ -554,7 +453,7 @@ def _gdb_bytes(sizes, n_bands, mode, bbox_target):
         xmin, ymin, xmax, ymax = bbox_target
         pixels = (max(xmax - xmin, 0) / CELL_SIZE_M) * (max(ymax - ymin, 0) / CELL_SIZE_M)
     else:
-        pixels = sum(_tile_pixels(s) for s in sizes.values() if s)
+        pixels = sum(_tile_pixels(e) for _d, e in sizes.values())
     return int(pixels * n_bands * 4)
 
 
@@ -568,7 +467,7 @@ def _scratch_bytes(sizes, n_bands, mode):
     """
     if mode != MODE_MOSAIC:
         return 0
-    per_tile = [_tile_pixels(s) * n_bands * 4 for s in sizes.values() if s]
+    per_tile = [_tile_pixels(e) * n_bands * 4 for _d, e in sizes.values()]
     if not per_tile:
         return 0
     return int(sum(per_tile) + max(per_tile))
@@ -913,6 +812,7 @@ class HamtaTesseraRaster:
         self._estimate_memo = (None, "")
         # Senast föreslagna rasternamnet, se updateParameters.
         self._name_memo = "tessera_{}".format(DEFAULT_YEAR)
+        self._cache_dir = _default_cache_dir()
 
     # ── Parametrar ────────────────────────────────────────────────────────────
 
@@ -1059,6 +959,10 @@ class HamtaTesseraRaster:
             p_name.value = suggestion
         self._name_memo = suggestion
 
+        # Cache-mappen styr var geotessera lägger sina filer och behövs när
+        # uppskattningen öppnar registret.
+        self._cache_dir = _p_cache.valueAsText or _default_cache_dir()
+
         # Målkoordinatsystemet gäller bara mosaiken.
         p_target_crs.enabled = (p_mode.valueAsText == MODE_MOSAIC)
 
@@ -1068,6 +972,7 @@ class HamtaTesseraRaster:
         p_estimate.enabled = False
 
         key = (
+            str(self._cache_dir),
             str(p_extent.valueAsText), str(p_extent_crs.valueAsText),
             p_year.valueAsText, p_dataset.valueAsText, p_bands.valueAsText,
             p_mode.valueAsText, str(p_target_crs.valueAsText), bool(p_exact.value),
@@ -1110,15 +1015,16 @@ class HamtaTesseraRaster:
                                target_ext.XMax, target_ext.YMax)
 
             if exact:
-                npy_dir = DATASETS[p_dataset.valueAsText or DEFAULT_DATASET][0]
-                sizes = _lookup_sizes(npy_dir, p_year.valueAsText or DEFAULT_YEAR, tiles)
-                available = {t: s for t, s in sizes.items() if s}
+                client = _client(p_dataset.valueAsText or DEFAULT_DATASET,
+                                 self._cache_dir_value())
+                available = _tile_sizes(client, p_year.valueAsText or DEFAULT_YEAR, tiles)
                 if not available:
                     return ("Området saknar publicerad data för {} — ingen av rutans "
                             "{} tiles finns.".format(p_year.valueAsText, len(tiles)))
                 prefix = "{} av {} tiles finns".format(len(available), len(tiles))
             else:
-                available = {t: _approx_tile_bytes(t[1]) for t in tiles}
+                available = {t: (_approx_tile_bytes(t[1]),
+                                 _approx_embedding_bytes(t[1])) for t in tiles}
                 prefix = "ca {} tiles (förutsätter att alla finns)".format(len(tiles))
 
             download = _download_bytes(available)
@@ -1138,6 +1044,9 @@ class HamtaTesseraRaster:
             return str(exc)
         except Exception as exc:
             return "Kunde inte uppskatta storleken: {}".format(exc)
+
+    def _cache_dir_value(self):
+        return getattr(self, "_cache_dir", None) or _default_cache_dir()
 
     @staticmethod
     def _crs_param(parameter, default=None):
@@ -1249,8 +1158,9 @@ class HamtaTesseraRaster:
         except ValueError as exc:
             messages.addErrorMessage(str(exc))
             raise arcpy.ExecuteError
-        except (urllib.error.HTTPError, urllib.error.URLError) as exc:
-            messages.addErrorMessage(_http_error_msg(exc))
+        except OSError as exc:
+            messages.addErrorMessage(
+                "Nätverks- eller filfel vid hämtning från Tessera: {}".format(exc))
             raise arcpy.ExecuteError
 
     def postExecute(self, parameters):
@@ -1266,10 +1176,7 @@ def _run(extent_value, fallback_sr, year, dataset, bands_text, out_gdb, out_name
          messages):
     """Utför hela hämtningen. Returnerar listan med skapade rasterdataset."""
 
-    if dataset not in DATASETS:
-        raise ValueError("Okänd dataset-version: {}".format(dataset))
-    npy_dir, lm_dir = DATASETS[dataset]
-
+    _require_geotessera()
     if not out_name:
         raise ValueError("Ange ett namn på utdata-rastern.")
     band_indices = _parse_bands(bands_text)
@@ -1321,9 +1228,9 @@ def _run(extent_value, fallback_sr, year, dataset, bands_text, out_gdb, out_name
     )
 
     # 2. Storlek — alltid innan något hämtas
-    messages.addMessage("Kontrollerar storlek mot servern...")
-    sizes = _lookup_sizes(npy_dir, year, tiles)
-    available = {tile: size for tile, size in sizes.items() if size}
+    client = _client(dataset, cache_dir, messages)
+    sizes = _tile_sizes(client, year, tiles)
+    available = sizes
     if not available:
         raise ValueError(
             "Området saknar publicerad data för {} i {} — ingen av rutans {} tiles "
@@ -1364,7 +1271,7 @@ def _run(extent_value, fallback_sr, year, dataset, bands_text, out_gdb, out_name
 
     # 3. Hämta rådata
     started = time.time()
-    cached_bytes = _fetch_tiles(available, npy_dir, lm_dir, year, cache_dir, messages)
+    cached_bytes = _fetch_tiles(client, available, year, messages)
     download_secs = time.time() - started
     if cached_bytes:
         messages.addMessage(
@@ -1378,12 +1285,12 @@ def _run(extent_value, fallback_sr, year, dataset, bands_text, out_gdb, out_name
     # 4. Bygg raster
     started = time.time()
     if mode == MODE_MOSAIC:
-        outputs = _build_mosaic(available, npy_dir, lm_dir, year, band_indices,
-                                cache_dir, out_gdb, out_name, target_sr, target_ext,
+        outputs = _build_mosaic(client, available, year, band_indices,
+                                out_gdb, out_name, target_sr, target_ext,
                                 overwrite, messages)
     else:
-        outputs = _build_tiles(available, npy_dir, lm_dir, year, band_indices,
-                               cache_dir, out_gdb, out_name, overwrite, messages)
+        outputs = _build_tiles(client, available, year, band_indices,
+                               out_gdb, out_name, overwrite, messages)
     build_secs = time.time() - started
 
     # Att skriva och projicera om 32-bitars float tar normalt längre tid än
@@ -1406,7 +1313,7 @@ def _run(extent_value, fallback_sr, year, dataset, bands_text, out_gdb, out_name
     # 6. Cache
     if not keep_cache:
         messages.addMessage("Tar bort nedladdade tiles...")
-        _clear_cache(available, npy_dir, lm_dir, year, cache_dir, messages)
+        _clear_cache(client, available, year, messages)
 
     messages.addMessage("Klar!")
     return outputs
@@ -1443,78 +1350,86 @@ def _check_disk_space(cache_dir, download_total, gdb_total, scratch_total, out_g
             )
 
 
-def _tile_paths(cache_dir, npy_dir, year, lon, lat):
-    """(embedding, scales, landmask) i cachen för en tile."""
-    name = _grid_name(lon, lat)
-    folder = os.path.join(cache_dir, npy_dir, str(year), name)
-    return (
-        os.path.join(folder, name + ".npy"),
-        os.path.join(folder, name + "_scales.npy"),
-        os.path.join(cache_dir, "landmasks", name + ".tiff"),
-    )
-
-
-def _fetch_tiles(available, npy_dir, lm_dir, year, cache_dir, messages):
+def _fetch_tiles(client, sizes, year, messages):
     """
     Hämta embedding, scales och landmask för varje tile till cachen.
-    Returnerar antalet byte som faktiskt passerade nätverket.
+    Returnerar antalet byte som faktiskt hämtades.
+
+    geotessera hämtar en fil i taget och hoppar över det som redan finns i
+    cache-mappen, så en avbruten körning fortsätter där den slutade.
     """
-    total = _download_bytes(available)
-    state = {"done": 0, "network": 0, "percent": -1}
+    total = _download_bytes(sizes)
+    done = 0
+    fetched = 0
+    percent = -1
 
     arcpy.SetProgressor("step", "Hämtar Tessera-tiles...", 0, 100, 1)
-
-    def progress(chunk):
-        # Förloppsindikatorn uppdateras bara när heltalsprocenten ändras.
-        # SetProgressorPosition går via Pros gränssnitt och är dyr nog att
-        # märkas om den anropas för varje läst chunk.
-        state["done"] += chunk
-        if not total:
-            return
-        percent = min(int(state["done"] * 100 / total), 100)
-        if percent != state["percent"]:
-            state["percent"] = percent
-            arcpy.SetProgressorPosition(percent)
-
     try:
-        for index, (tile, emb_size) in enumerate(sorted(available.items()), start=1):
+        for index, (tile, size) in enumerate(sorted(sizes.items()), start=1):
             lon, lat = tile
-            emb_path, scales_path, lm_path = _tile_paths(cache_dir, npy_dir, year, lon, lat)
+            tile_bytes = size[0] if isinstance(size, tuple) else size
             arcpy.SetProgressorLabel(
-                "Hämtar {} ({}/{})".format(_grid_name(lon, lat), index, len(available))
+                "Hämtar {} ({}/{})".format(_grid_name(lon, lat), index, len(sizes))
             )
+            before = _cached_bytes(client, year, lon, lat)
+            try:
+                _fetch_tile_files(client, year, lon, lat)
+            except Exception as exc:                        # noqa: BLE001
+                raise ValueError(
+                    "Kunde inte hämta {}: {}".format(_grid_name(lon, lat), exc)
+                )
+            fetched += max(_cached_bytes(client, year, lon, lat) - before, 0)
 
-            for url, path, size in (
-                (_embedding_url(npy_dir, year, lon, lat), emb_path, emb_size),
-                (_scales_url(npy_dir, year, lon, lat), scales_path, _scales_bytes(emb_size)),
-                (_landmask_url(lm_dir, lon, lat), lm_path, None),
-            ):
-                try:
-                    _, reused = _download(url, path, size, progress)
-                except (urllib.error.URLError, OSError) as exc:
-                    raise ValueError(
-                        "Kunde inte hämta {}: {}".format(os.path.basename(path),
-                                                         _http_error_msg(exc))
-                    )
-                if not reused:
-                    state["network"] += os.path.getsize(path)
+            done += tile_bytes
+            if total:
+                # Förloppet uppdateras per tile och bara när procenten ändras;
+                # SetProgressorPosition går via Pros gränssnitt och är inte gratis.
+                new_percent = min(int(done * 100 / total), 100)
+                if new_percent != percent:
+                    percent = new_percent
+                    arcpy.SetProgressorPosition(percent)
     finally:
         arcpy.ResetProgressor()
 
-    return state["network"]
+    return fetched
 
 
-def _build_tiles(available, npy_dir, lm_dir, year, band_indices, cache_dir, out_gdb,
+def _cached_bytes(client, year, lon, lat):
+    """Hur mycket av tilen som redan ligger i cache-mappen."""
+    total = 0
+    for path in _cached_paths(client, year, lon, lat):
+        try:
+            total += os.path.getsize(path)
+        except OSError:
+            pass
+    return total
+
+
+def _cached_paths(client, year, lon, lat):
+    """Förväntade sökvägar i cachen, utan att något hämtas."""
+    name = _grid_name(lon, lat)
+    root = str(getattr(client, "embeddings_dir", "") or "")
+    if not root:
+        return []
+    emb_dir = os.path.join(root, gt_registry.EMBEDDINGS_DIR_NAME, str(year), name)
+    return [
+        os.path.join(emb_dir, name + ".npy"),
+        os.path.join(emb_dir, name + "_scales.npy"),
+        os.path.join(root, gt_registry.LANDMASKS_DIR_NAME, name + ".tiff"),
+    ]
+
+
+def _build_tiles(client, sizes, year, band_indices, out_gdb,
                  out_name, overwrite, messages):
     """En raster per tile i tilens egen UTM-projektion, utan omsampling."""
     outputs = []
-    arcpy.SetProgressor("step", "Skriver rasterdata...", 0, len(available), 1)
+    arcpy.SetProgressor("step", "Skriver rasterdata...", 0, len(sizes), 1)
     try:
-        for index, tile in enumerate(sorted(available)):
+        for index, tile in enumerate(sorted(sizes)):
             lon, lat = tile
             arcpy.SetProgressorPosition(index)
             arcpy.SetProgressorLabel("Skriver {} ({}/{})".format(
-                _grid_name(lon, lat), index + 1, len(available)))
+                _grid_name(lon, lat), index + 1, len(sizes)))
 
             name = arcpy.ValidateTableName(
                 "{}_{}_{}".format(out_name, _tile_token(lon), _tile_token(lat)), out_gdb
@@ -1527,16 +1442,16 @@ def _build_tiles(available, npy_dir, lm_dir, year, band_indices, cache_dir, out_
                     continue
                 arcpy.management.Delete(out_path)
 
-            emb, scales, landmask = _tile_paths(cache_dir, npy_dir, year, lon, lat)
+            emb, scales, landmask = _fetch_tile_files(client, year, lon, lat)
             _tile_raster(emb, scales, landmask, band_indices, out_path)
             outputs.append(out_path)
-        arcpy.SetProgressorPosition(len(available))
+        arcpy.SetProgressorPosition(len(sizes))
     finally:
         arcpy.ResetProgressor()
     return outputs
 
 
-def _build_mosaic(available, npy_dir, lm_dir, year, band_indices, cache_dir, out_gdb,
+def _build_mosaic(client, sizes, year, band_indices, out_gdb,
                   out_name, target_sr, target_ext, overwrite, messages):
     """
     En sammanfogad raster i target_sr, klippt till bounding boxen.
@@ -1573,15 +1488,15 @@ def _build_mosaic(available, npy_dir, lm_dir, year, band_indices, cache_dir, out
         )
         arcpy.env.extent = target_ext
 
-        arcpy.SetProgressor("step", "Bygger raster...", 0, len(available), 1)
-        for index, tile in enumerate(sorted(available)):
+        arcpy.SetProgressor("step", "Bygger raster...", 0, len(sizes), 1)
+        for index, tile in enumerate(sorted(sizes)):
             lon, lat = tile
             grid = _grid_name(lon, lat)
             arcpy.SetProgressorPosition(index)
             arcpy.SetProgressorLabel("Bygger {} ({}/{})".format(
-                grid, index + 1, len(available)))
+                grid, index + 1, len(sizes)))
 
-            emb, scales, landmask = _tile_paths(cache_dir, npy_dir, year, lon, lat)
+            emb, scales, landmask = _fetch_tile_files(client, year, lon, lat)
             native = os.path.join(scratch_dir, grid + "_native.tif")
             _tile_raster(emb, scales, landmask, band_indices, native)
 
@@ -1599,7 +1514,7 @@ def _build_mosaic(available, npy_dir, lm_dir, year, band_indices, cache_dir, out
             except Exception:
                 pass
 
-        arcpy.SetProgressorPosition(len(available))
+        arcpy.SetProgressorPosition(len(sizes))
         arcpy.ResetProgressor()
 
         if not projected:
@@ -1641,21 +1556,14 @@ def _add_to_map(outputs, messages):
             messages.addWarningMessage("  Kunde inte lägga till {}: {}".format(path, exc))
 
 
-def _clear_cache(available, npy_dir, lm_dir, year, cache_dir, messages):
-    for tile in available:
+def _clear_cache(client, sizes, year, messages):
+    """Ta bort de hämtade filerna för körningens tiles ur cache-mappen."""
+    for tile in sizes:
         lon, lat = tile
-        emb, scales, landmask = _tile_paths(cache_dir, npy_dir, year, lon, lat)
-        for base in (emb, scales, landmask):
-            for path in (base, base + ".part", base + ".part.etag"):
-                try:
-                    if os.path.isfile(path):
-                        os.remove(path)
-                except OSError as exc:
-                    messages.addWarningMessage(
-                        "  Kunde inte ta bort {}: {}".format(path, exc))
-        folder = os.path.dirname(emb)
-        try:
-            if os.path.isdir(folder) and not os.listdir(folder):
-                os.rmdir(folder)
-        except OSError:
-            pass
+        for path in _cached_paths(client, year, lon, lat):
+            try:
+                if os.path.isfile(path):
+                    os.remove(path)
+            except OSError as exc:
+                messages.addWarningMessage(
+                    "  Kunde inte ta bort {}: {}".format(path, exc))
