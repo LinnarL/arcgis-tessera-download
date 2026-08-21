@@ -775,12 +775,26 @@ def _default_extent_crs():
 
 def _default_cache_dir():
     """
-    Standardmapp för nedladdade tiles: lokal temp-mapp.
+    Standardmapp för nedladdade tiles, skapad om den saknas.
 
-    Medvetet inte i projektmappen — den ligger ofta i OneDrive, och rådata för
-    ett par tiles är hundratals MB som då skulle synkas till molnet.
+    Inte tempfile.gettempdir(): inne i Pro pekar den på en eget mapp per session
+    (ArcGISProTemp<nnnn>) som dessutom ofta blir kvar när Pro stängs. En sådan
+    sökväg finns inte förrän någon skapar den, vilket gör att parametern faller
+    på ERROR 000732 redan när dialogen öppnas, och den byter namn varje gång Pro
+    startas om så att ingenting någonsin återanvänds.
+
+    Inte heller projektmappen — den ligger ofta i OneDrive, och rådata för ett
+    par tiles är hundratals MB som då skulle synkas till molnet.
+
+    Mappen skapas här, inte vid körning, just för att parametern ska validera.
     """
-    return os.path.join(tempfile.gettempdir(), _CACHE_DIRNAME)
+    base = os.environ.get("LOCALAPPDATA") or tempfile.gettempdir()
+    path = os.path.join(base, _CACHE_DIRNAME)
+    try:
+        os.makedirs(path, exist_ok=True)
+    except OSError:
+        pass
+    return path
 
 
 # =============================================================================
@@ -922,11 +936,12 @@ class HamtaTesseraRaster:
         p_cache.value = _default_cache_dir()
 
         p_keep = arcpy.Parameter(
-            displayName="Behåll nedladdade tiles efter körningen",
+            displayName="Behåll nedladdade tiles efter körningen (snabbare omkörning, "
+                        "hundratals MB per tile)",
             name="keep_cache", datatype="GPBoolean",
             parameterType="Optional", direction="Input", category="Nedladdning",
         )
-        p_keep.value = True
+        p_keep.value = False
 
         p_add = arcpy.Parameter(
             displayName="Lägg till resultatet i kartan",

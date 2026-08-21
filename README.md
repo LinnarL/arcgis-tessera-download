@@ -61,8 +61,8 @@ The UI is in Swedish, matching a Swedish ArcGIS Pro install.
 | Koordinatsystem för mosaiken | SWEREF99 TM | Mosaic mode only |
 | Skriv över befintlig raster | on | |
 | Avbryt om nedladdningen överstiger | 5 GB | Hard stop before anything is downloaded |
-| Cache-mapp för nedladdade tiles | system temp | Reused across runs. Avoid cloud-synced folders |
-| Behåll nedladdade tiles | on | |
+| Cache-mapp för nedladdade tiles | `%LOCALAPPDATA%\Tessera_nedladdning` | Where tiles are downloaded to. Avoid cloud-synced folders |
+| Behåll nedladdade tiles | off | On keeps the tiles so a re-run skips the download, at hundreds of MB per tile |
 | Lägg till resultatet i kartan | on | |
 
 ## Output
@@ -95,9 +95,14 @@ mosaiken if you want the raster in your project's own CRS instead.
 
 ## Downloads and caching
 
-Downloads go through geotessera, which reads from the project's S3 bucket. Tiles are cached in
-the folder given by Cache-mapp för nedladdade tiles and reused across runs, so a repeated or
-resumed run only fetches what is missing.
+Downloads go through geotessera, which reads from the project's S3 bucket. By default the
+downloaded tiles are deleted once the raster is written, so nothing accumulates. Tick Behåll
+nedladdade tiles to keep them, which makes a re-run over the same area skip the download at the
+cost of a few hundred MB per tile.
+
+The download folder deliberately sits under `%LOCALAPPDATA%` rather than the system temp
+directory. Inside ArcGIS Pro the temp directory is a per-session folder that changes on every
+restart and is often left behind, so a cache there could never be reused.
 
 The first run also downloads a manifest listing every published tile. It takes a while and is
 cached afterwards. That manifest is what makes the size estimate exact without any extra
