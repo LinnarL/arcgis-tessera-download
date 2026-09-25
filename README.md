@@ -64,7 +64,7 @@ The UI is in Swedish, matching a Swedish ArcGIS Pro install.
 | Avbryt om nedladdningen överstiger | 5 GB | Hard stop before anything is downloaded |
 | Cache-mapp för nedladdade tiles | `%LOCALAPPDATA%\Tessera_nedladdning` | Where tiles are downloaded to. Avoid cloud-synced folders |
 | Behåll nedladdade tiles | off | On keeps the tiles so a re-run skips the download, at hundreds of MB per tile |
-| Lägg till resultatet i kartan | on | |
+| Lägg till resultatet i kartan | on | Add the result to the map |
 
 ## Output
 
