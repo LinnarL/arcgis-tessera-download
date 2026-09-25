@@ -35,9 +35,10 @@ does not allow installing into it. Clone the environment first.
    python -m pip install "pyarrow==20.0.0"
    ```
 
-3. Clone or download this repo.
-4. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `TesseraToGDB.pyt`.
-5. Open Tessera, Hämta Tessera-raster till geodatabas.
+3. If you do not have `fastparquet` installed in your cloned python environment then you will need to install it which can be done simply through the ArcGIS Pro package manager. 
+4. Clone or download this repo.
+5. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `TesseraToGDB.pyt`.
+6. Open Tessera, Hämta Tessera-raster till geodatabas.
 
 If the environment is wrong the tool stops with a message naming the active
 environment rather than failing part way through a download.
