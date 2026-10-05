@@ -1062,8 +1062,11 @@ def _default_extent_crs():
     lämnar bara fyra tal vidare — spatialReference är None. Utan kartans
     koordinatsystem som utgångspunkt tolkas talen i fel system, och ett projekt
     i t.ex. SWEREF 99 18 00 hämtar då data för fel plats utan att något larmar.
+
+    Utan karta lämnas parametern tom (None), så att loggen säger att SWEREF 99
+    TM antogs i stället för att det ser ut som ett val i parametern.
     """
-    return _map_sr() or _sr(SWEREF99TM_WKID)
+    return _map_sr()
 
 
 def _default_cache_dir():
