@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-TesseraToGDB.pyt
+TesseraHamtaEmbeddings.pyt
 
 Hämtar Tessera-embeddings (rasterdata) för ett område och skriver dem till en
 filgeodatabas. Området avgränsas antingen med polygoner (ur ett lager, där ett
@@ -34,7 +34,7 @@ körningens första meddelanden. Storleken kommer ur geotesseras register och
 kostar inga extra anrop.
 
 Verktygstips (parameterförklaringar) skrivs till
-TesseraToGDB.HamtaTesseraRaster.pyt.xml från TOOLTIPS nedan när verktygslådan
+TesseraHamtaEmbeddings.HamtaTesseraRaster.pyt.xml från TOOLTIPS nedan när verktygslådan
 laddas, så att texten bara finns på ett ställe.
 
 Krav : ArcGIS Pro 3.x (arcpy), numpy och geotessera.
@@ -1152,7 +1152,7 @@ def _write_tool_metadata(tool_cls, toolbox_alias):
 
 class Toolbox:
     def __init__(self):
-        self.label = "Tessera"
+        self.label = "Tessera: hämta embeddings"
         self.alias = "tessera"
         self.tools = [HamtaTesseraRaster]
         _write_tool_metadata(HamtaTesseraRaster, self.alias)

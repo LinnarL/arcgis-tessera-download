@@ -1,4 +1,4 @@
-# Tessera embeddings to GDB
+# Tessera hämta embeddings
 
 ArcGIS Pro Python toolbox that downloads Tessera satellite embeddings for an area into a file
 geodatabase. The area is either polygons (from a layer, or drawn in the map) or an extent (the map
@@ -37,7 +37,7 @@ does not allow installing into it. Clone the environment first.
    ```
 
 3. Clone or download this repo.
-4. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `TesseraToGDB.pyt`.
+4. In ArcGIS Pro: Catalog, Toolboxes, Add Toolbox, select `TesseraHamtaEmbeddings.pyt`.
 5. Open Tessera, Hämta Tessera-raster till geodatabas.
 
 If the environment is wrong the tool stops with a message naming the active
@@ -115,7 +115,7 @@ old ones, so call the tool with keyword arguments. The older label `Polygoner i 
 accepted for `aoi_mode`.
 
 ```python
-arcpy.ImportToolbox(r"...\TesseraToGDB.pyt")
+arcpy.ImportToolbox(r"...\TesseraHamtaEmbeddings.pyt")
 arcpy.tessera.HamtaTesseraRaster(aoi_mode="Polygoner (lager eller ritade i kartan)",
                                  aoi="my_polygon_layer", out_gdb=r"C:\data\out.gdb",
                                  out_name="tessera_2024")
