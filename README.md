@@ -1,7 +1,8 @@
 # Tessera embeddings to GDB
 
-ArcGIS Pro Python toolbox that downloads Tessera satellite embeddings for a bounding box into a
-file geodatabase.
+ArcGIS Pro Python toolbox that downloads Tessera satellite embeddings for an area into a file
+geodatabase. The area is either polygons (from a layer, or drawn in the map) or an extent (the map
+view, a layer's extent, a drawn rectangle or typed coordinates).
 
 Tessera is an Earth observation foundation model from the University of Cambridge. It publishes
 global annual embeddings built from Sentinel-1 and Sentinel-2: 128 channels per pixel at 10 m
@@ -48,8 +49,10 @@ The UI is in Swedish, matching a Swedish ArcGIS Pro install.
 
 | Parameter | Default | Notes |
 |---|---|---|
-| Bounding box | current map view | Area to download |
-| Koordinatsystem för bounding boxen | the map's CRS | How the extent numbers are read. ArcGIS hands the tool an extent without a CRS, so this is the tool's only way to know |
+| Avgränsa området med | Utbredning | `Polygoner (lager eller ritade i kartan)` or `Utbredning (kartvy, lager eller koordinater)`. Only the chosen input below is enabled |
+| Intresseområde (polygoner) | empty | Polygon layer (a selection is honoured) or polygons drawn in the dialog. Any CRS. Polygon mode only |
+| Utbredning | current map view | Rectangle to download. Extent mode only |
+| Koordinatsystem för utbredningen | the map's CRS | How typed extent numbers are read when the extent carries no CRS of its own. Extent mode only |
 | År | 2024 | 2017 to 2025 for the v1 dataset |
 | Dataset-version | v1 | v1 is global. v2 is beta with partial year coverage, v1.1 is Cambridge only |
 | Band att spara | all 128 | Accepts `1-16,64`. Reduces geodatabase size, not download size |
@@ -68,30 +71,55 @@ The UI is in Swedish, matching a Swedish ArcGIS Pro install.
 ## Output
 
 Mosaic mode reprojects every tile to the chosen coordinate system on a shared 10 m grid and
-merges them into one raster clipped to the bounding box. Overlaps keep the first tile's values
+merges them into one raster clipped to the area's rectangle. Overlaps keep the first tile's values
 rather than blending, so no pixel holds an averaged embedding vector.
 
-Tile mode writes one raster per tile in the tile's own UTM zone with no resampling. Use it when
-you want the values untouched.
+With polygons, only tiles that intersect the polygons themselves are downloaded, not every tile
+in their bounding box. The mosaic covers the polygons' bounding box and every cell outside the
+polygons is NoData. The clip uses the Clip tool with clipping geometry, which needs no Spatial
+Analyst licence. It writes the unclipped mosaic under a temporary name in the geodatabase first,
+so the geodatabase briefly needs twice the final size.
+
+Tile mode writes one raster per tile in the tile's own UTM zone with no resampling. Tiles are
+written whole: they are not clipped to the extent or to the polygons. Use it when you want the
+values untouched.
 
 Values are 32-bit float. Tessera stores embeddings quantised as int8 with one scale factor per
 pixel, and the tool multiplies them out before writing.
 
 ## Coordinate systems
 
-ArcGIS passes the bounding box to the tool as four numbers with no coordinate system attached,
-so the tool cannot detect which CRS you drew the box in. It assumes the active map's CRS, which
-is right in almost every case, and prints the assumption on the first line of the run log:
+Polygons always carry their own coordinate system and need no setting.
+
+An extent picked from a layer or dataset carries its CRS. Typed coordinates and the map view's
+extent reach the tool as four bare numbers, so the tool has to assume a CRS: Koordinatsystem för
+utbredningen, which defaults to the active map's CRS (SWEREF 99 TM when there is no map). The run
+log names the CRS used and where it came from:
 
 ```
-Bounding box tolkas som SWEREF99_18_00 (EPSG:3011): 173565.35, 6578601.74 till 177565.35, 6582601.74
+Utbredningen tolkas som SWEREF99_18_00 (EPSG:3011) (den aktiva kartans koordinatsystem): 173565.35, 6578601.74 till 177565.35, 6582601.74
 ```
 
-If that line names the wrong system, set Koordinatsystem för bounding boxen yourself. Getting it
+If that line names the wrong system, set Koordinatsystem för utbredningen yourself. Getting it
 wrong does not fail, it downloads a different part of the world.
 
 The output CRS is separate and defaults to SWEREF99 TM in mosaic mode. Set Koordinatsystem för
 mosaiken if you want the raster in your project's own CRS instead.
+
+## Scripting
+
+Parameter names: `aoi_mode`, `aoi`, `extent`, `extent_crs`, `year`, `dataset`, `bands`,
+`estimate`, `exact_estimate`, `out_gdb`, `out_name`, `out_mode`, `target_crs`, `overwrite`,
+`max_gb`, `cache_dir`, `keep_cache`, `add_to_map`. The area parameters were added in front of the
+old ones, so call the tool with keyword arguments. The older label `Polygoner i ett lager` is still
+accepted for `aoi_mode`.
+
+```python
+arcpy.ImportToolbox(r"...\TesseraToGDB.pyt")
+arcpy.tessera.HamtaTesseraRaster(aoi_mode="Polygoner (lager eller ritade i kartan)",
+                                 aoi="my_polygon_layer", out_gdb=r"C:\data\out.gdb",
+                                 out_name="tessera_2024")
+```
 
 ## Downloads and caching
 
